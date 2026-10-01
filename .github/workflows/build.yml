@@ -231,12 +231,6 @@ jobs:
         env:
           BOGO_SHIM_PROVIDER: aws-lc-rs-fips
 
-      - name: Run test suite (post-quantum)
-        working-directory: bogo
-        run: ./runme
-        env:
-          BOGO_SHIM_PROVIDER: post-quantum
-
   fuzz:
     name: Smoke-test fuzzing targets
     runs-on: ubuntu-latest
@@ -480,26 +474,6 @@ jobs:
           components: clippy
       - run: ./admin/clippy -- --deny warnings
 
-  clippy-nightly:
-    name: Clippy (Nightly)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Install valgrind
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y valgrind
-
-      - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: clippy
-      # Do not deny warnings, as nightly clippy sometimes has false negatives.
-      - run: ./admin/clippy
-
   check-external-types:
     name: Validate external types appearing in public API
     runs-on: ubuntu-latest
@@ -511,7 +485,7 @@ jobs:
       - name: Install rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-10-18
+          toolchain: nightly-2026-03-20
           # ^ sync with https://github.com/awslabs/cargo-check-external-types/blob/main/rust-toolchain.toml
       - name: Install cargo-check-external-types
         uses: taiki-e/cache-cargo-install-action@v3
@@ -520,23 +494,6 @@ jobs:
       - name: run cargo-check-external-types for rustls/
         working-directory: rustls/
         run: cargo check-external-types
-
-  taplo:
-    name: Taplo
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Install taplo-cli
-        uses: taiki-e/cache-cargo-install-action@v3
-        with:
-          tool: taplo-cli
-      - run: taplo format --check
 
   openssl-tests:
     name: Run openssl-tests

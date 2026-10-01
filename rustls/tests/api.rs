@@ -9,14 +9,25 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fmt, mem};
 
+#[cfg(feature = "aws_lc_rs")]
+use pki_types::PrivateKeyDer;
 use pki_types::{CertificateDer, IpAddr, ServerName, UnixTime};
-use rustls::client::{ResolvesClientCert, Resumption, verify_server_cert_signed_by_trust_anchor};
+use rcgen::{
+    CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+};
+use rustls::client::{
+    ResolvesClientCert, Resumption, TicketRequest, verify_server_cert_signed_by_trust_anchor,
+};
+use rustls::crypto::cipher::{AeadKey, InboundOpaqueMessage, Iv};
+use rustls::crypto::tls13::{HkdfExpander, OkmBlock, expand};
 use rustls::crypto::{ActiveKeyExchange, CryptoProvider, SharedSecret, SupportedKxGroup};
 use rustls::internal::msgs::base::Payload;
 use rustls::internal::msgs::codec::Codec;
 use rustls::internal::msgs::enums::{AlertLevel, ExtensionType};
 use rustls::internal::msgs::message::{Message, MessagePayload, PlainMessage};
-use rustls::server::{CertificateType, ClientHello, ParsedCertificate, ResolvesServerCert};
+use rustls::server::{
+    Acceptor, CertificateType, ClientHello, ParsedCertificate, ResolvesServerCert,
+};
 use rustls::{
     AlertDescription, CertificateError, CipherSuite, ClientConfig, ClientConnection,
     ConnectionCommon, ConnectionTrafficSecrets, ContentType, DistinguishedName, Error,
@@ -391,6 +402,67 @@ fn versions() {
     );
 }
 
+#[test]
+fn server_does_not_negotiate_tls12_after_hrr() {
+    let (_, mut server) = make_pair(KeyType::Rsa2048, &provider::default_provider());
+
+    // first client hello requires a HRR
+    server
+        .read_tls(
+            &mut encoding::message_framing(
+                ContentType::Handshake,
+                ProtocolVersion::TLSv1_2,
+                encoding::client_hello_with_extensions(vec![
+                    encoding::Extension::new_sig_algs(),
+                    encoding::Extension::new_kx_groups(),
+                    encoding::Extension::new_versions(),
+                    encoding::Extension {
+                        typ: ExtensionType::KeyShare,
+                        body: vec![0, 0],
+                    },
+                ]),
+            )
+            .as_slice(),
+        )
+        .unwrap();
+    server.process_new_packets().unwrap();
+
+    let mut server_output = Vec::new();
+    server
+        .write_tls(&mut server_output)
+        .unwrap();
+    assert!(
+        &server_output[11..43] == HRR_RANDOM_VALUE,
+        "server didn't reply with a HRR"
+    );
+
+    // second client hello only offers TLS1.2
+    server
+        .read_tls(
+            &mut encoding::message_framing(
+                ContentType::Handshake,
+                ProtocolVersion::TLSv1_2,
+                encoding::client_hello_with_extensions(vec![
+                    encoding::Extension::new_sig_algs(),
+                    encoding::Extension::new_kx_groups(),
+                ]),
+            )
+            .as_slice(),
+        )
+        .unwrap();
+    assert_eq!(
+        server
+            .process_new_packets()
+            .unwrap_err(),
+        PeerIncompatible::SupportedVersionsExtensionRequired.into()
+    );
+}
+
+const HRR_RANDOM_VALUE: &[u8] = &[
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+];
+
 fn check_read(reader: &mut dyn io::Read, bytes: &[u8]) {
     let mut buf = vec![0u8; bytes.len() + 1];
     assert_eq!(bytes.len(), reader.read(&mut buf).unwrap());
@@ -421,7 +493,7 @@ fn check_read_buf(reader: &mut dyn io::Read, bytes: &[u8]) {
     use std::mem::MaybeUninit;
 
     let mut buf = [MaybeUninit::<u8>::uninit(); 128];
-    let mut buf: BorrowedBuf<'_> = buf.as_mut_slice().into();
+    let mut buf: BorrowedBuf<'_, u8> = buf.as_mut_slice().into();
     reader.read_buf(buf.unfilled()).unwrap();
     assert_eq!(buf.filled(), bytes);
 }
@@ -432,7 +504,7 @@ fn check_read_buf_err(reader: &mut dyn io::Read, err_kind: io::ErrorKind) {
     use std::mem::MaybeUninit;
 
     let mut buf = [MaybeUninit::<u8>::uninit(); 1];
-    let mut buf: BorrowedBuf<'_> = buf.as_mut_slice().into();
+    let mut buf: BorrowedBuf<'_, u8> = buf.as_mut_slice().into();
     let err = reader
         .read_buf(buf.unfilled())
         .unwrap_err();
@@ -1944,6 +2016,12 @@ fn default_signature_schemes(version: ProtocolVersion) -> Vec<SignatureScheme> {
             SignatureScheme::RSA_PKCS1_SHA512,
             SignatureScheme::RSA_PKCS1_SHA384,
             SignatureScheme::RSA_PKCS1_SHA256,
+        ]);
+    } else if provider_is_aws_lc_rs() {
+        v.extend_from_slice(&[
+            SignatureScheme::ML_DSA_44,
+            SignatureScheme::ML_DSA_65,
+            SignatureScheme::ML_DSA_87,
         ]);
     }
 
@@ -4193,6 +4271,161 @@ fn key_log_for_tls13() {
     assert_eq!(client_resume_log[4], server_resume_log[5]);
 }
 
+/// A TLS1.3 client must not accept `EncryptedExtensions` carried in the same
+/// plaintext record as `ServerHello`.
+///
+/// The server's first flight is rewritten so the complete `EncryptedExtensions`
+/// message follows `ServerHello` in its unprotected record, and the remaining
+/// handshake messages are re-encrypted under the server handshake traffic secret.
+/// The transcript is unchanged, so only the key change alignment check can
+/// catch this.
+#[test]
+fn client_rejects_encrypted_extensions_in_server_hello_record() {
+    let SupportedCipherSuite::Tls13(suite) = cipher_suite::TLS13_AES_256_GCM_SHA384 else {
+        unreachable!();
+    };
+    let provider = CryptoProvider {
+        cipher_suites: vec![cipher_suite::TLS13_AES_256_GCM_SHA384],
+        ..provider::default_provider()
+    };
+    let kt = KeyType::Rsa2048;
+
+    let key_log = Arc::new(KeyLogToVec::new("server"));
+    let mut server_config = make_server_config(kt, &provider);
+    server_config.key_log = key_log.clone();
+    let (mut client, mut server) =
+        make_pair_for_configs(make_client_config(kt, &provider), server_config);
+
+    transfer(&mut client, &mut server);
+    server.process_new_packets().unwrap();
+    let mut server_flight = Vec::new();
+    while server.wants_write() {
+        server
+            .write_tls(&mut server_flight)
+            .unwrap();
+    }
+
+    let secret = key_log
+        .take()
+        .into_iter()
+        .find(|item| item.label == "SERVER_HANDSHAKE_TRAFFIC_SECRET")
+        .unwrap()
+        .secret;
+    let flight = move_encrypted_extensions_into_server_hello(&server_flight, suite, &secret);
+
+    let mut rd = flight.as_slice();
+    while !rd.is_empty() {
+        client.read_tls(&mut rd).unwrap();
+    }
+    assert_eq!(
+        client
+            .process_new_packets()
+            .unwrap_err(),
+        PeerMisbehaved::KeyEpochWithPendingFragment.into()
+    );
+}
+
+fn move_encrypted_extensions_into_server_hello(
+    flight: &[u8],
+    suite: &rustls::Tls13CipherSuite,
+    secret: &[u8],
+) -> Vec<u8> {
+    let expander = suite
+        .hkdf_provider
+        .expander_for_okm(&OkmBlock::new(secret));
+    let traffic_key = || -> (AeadKey, Iv) {
+        (
+            hkdf_expand_label::<AeadKey, 32>(&*expander, b"key"),
+            hkdf_expand_label::<Iv, 12>(&*expander, b"iv"),
+        )
+    };
+
+    let mut records = Vec::new();
+    let mut rest = flight;
+    while !rest.is_empty() {
+        let len = u16::from_be_bytes([rest[3], rest[4]]) as usize;
+        records.push(rest[..5 + len].to_vec());
+        rest = &rest[5 + len..];
+    }
+
+    let (key, iv) = traffic_key();
+    let mut decrypter = suite.aead_alg.decrypter(key, iv);
+    let mut handshake = Vec::new();
+    for (seq, record) in records
+        .iter_mut()
+        .filter(|record| ContentType::from(record[0]) == ContentType::ApplicationData)
+        .enumerate()
+    {
+        let decrypted = decrypter
+            .decrypt(
+                InboundOpaqueMessage::new(
+                    ContentType::ApplicationData,
+                    ProtocolVersion::TLSv1_2,
+                    &mut record[5..],
+                ),
+                seq as u64,
+            )
+            .unwrap();
+        assert_eq!(decrypted.typ, ContentType::Handshake);
+        handshake.extend_from_slice(decrypted.payload);
+    }
+
+    assert_eq!(
+        HandshakeType::from(handshake[0]),
+        HandshakeType::EncryptedExtensions
+    );
+    let ee_len = 4 + u32::from_be_bytes([0, handshake[1], handshake[2], handshake[3]]) as usize;
+    let (encrypted_extensions, remainder) = handshake.split_at(ee_len);
+
+    let mut output = Vec::new();
+    for record in records
+        .iter()
+        .filter(|record| ContentType::from(record[0]) != ContentType::ApplicationData)
+    {
+        let mut body = record[5..].to_vec();
+        if ContentType::from(record[0]) == ContentType::Handshake {
+            assert_eq!(HandshakeType::from(body[0]), HandshakeType::ServerHello);
+            body.extend_from_slice(encrypted_extensions);
+        }
+        output.extend(encoding::message_framing(
+            ContentType::from(record[0]),
+            ProtocolVersion::TLSv1_2,
+            body,
+        ));
+    }
+
+    let (key, iv) = traffic_key();
+    let mut encrypter = suite.aead_alg.encrypter(key, iv);
+    let remainder = PlainMessage {
+        typ: ContentType::Handshake,
+        version: ProtocolVersion::TLSv1_2,
+        payload: Payload::new(remainder.to_vec()),
+    };
+    output.extend(
+        encrypter
+            .encrypt(remainder.borrow_outbound(), 0)
+            .unwrap()
+            .encode(),
+    );
+    output
+}
+
+fn hkdf_expand_label<T: From<[u8; N]>, const N: usize>(
+    expander: &dyn HkdfExpander,
+    label: &[u8],
+) -> T {
+    expand(
+        expander,
+        &[
+            &(N as u16).to_be_bytes(),
+            &[(b"tls13 ".len() + label.len()) as u8],
+            b"tls13 ",
+            label,
+            &[0],
+        ],
+    )
+}
+
 #[test]
 fn vectored_write_for_server_appdata() {
     let (mut client, mut server) = make_pair(KeyType::Rsa2048, &provider::default_provider());
@@ -5008,6 +5241,7 @@ fn server_detects_excess_streamed_early_data() {
 
 mod test_quic {
     use rustls::quic::{self, ConnectionCommon};
+    use rustls::{CipherSuiteCommon, Tls13CipherSuite};
 
     use super::*;
 
@@ -5383,6 +5617,57 @@ mod test_quic {
     }
 
     #[test]
+    fn test_quic_server_rejects_tls12_hello() {
+        let mut server = quic::ServerConnection::new(
+            Arc::new(make_server_config(
+                KeyType::EcdsaP256,
+                &provider::default_provider(),
+            )),
+            quic::Version::V2,
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            server
+                .read_hs(&encoding::client_hello(
+                    ProtocolVersion::TLSv1_2,
+                    &[0x12; 32],
+                    &[0x00],
+                    vec![CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256],
+                    vec![encoding::Extension::new_sig_algs()],
+                ))
+                .err(),
+            Some(PeerIncompatible::Tls13RequiredForQuic.into())
+        );
+    }
+
+    #[test]
+    fn test_quic_client_rejects_tls12_server() {
+        let mut client = quic::ClientConnection::new(
+            Arc::new(make_client_config(
+                KeyType::EcdsaP256,
+                &provider::default_provider(),
+            )),
+            quic::Version::V2,
+            "hello.com".try_into().unwrap(),
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            client
+                .read_hs(&encoding::server_hello(
+                    ProtocolVersion::TLSv1_2,
+                    &[0x12; 32],
+                    &[0],
+                    CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                    vec![]
+                ))
+                .err(),
+            Some(PeerIncompatible::ServerTlsVersionIsDisabledByOurConfig.into()),
+        );
+    }
+
+    #[test]
     fn test_quic_server_no_params_received() {
         let provider = provider::default_provider();
         let server_config = make_server_config_with_versions(
@@ -5434,10 +5719,75 @@ mod test_quic {
         assert_eq!(
             server.read_hs(buf.as_slice()).err(),
             Some(Error::PeerIncompatible(
-                PeerIncompatible::SupportedVersionsExtensionRequired
+                PeerIncompatible::Tls13RequiredForQuic
             )),
         );
     }
+
+    #[test]
+    fn client_rejects_server_choosing_non_quic_suite() {
+        // we support [TLS13_AES_128_GCM_SHA256_WITHOUT_QUIC, TLS13_AES_256_GCM_SHA384].  our
+        // offer is [TLS13_AES_256_GCM_SHA384].  The server chooses TLS13_AES_128_GCM_SHA256_WITHOUT_QUIC
+        // which we should reject.
+        let provider = CryptoProvider {
+            cipher_suites: vec![
+                TLS13_AES_128_GCM_SHA256_WITHOUT_QUIC,
+                provider::cipher_suite::TLS13_AES_256_GCM_SHA384,
+            ],
+            kx_groups: vec![provider::kx_group::SECP256R1],
+            ..provider::default_provider()
+        };
+        let mut client = quic::ClientConnection::new(
+            Arc::new(make_client_config(KeyType::EcdsaP256, &provider)),
+            quic::Version::V2,
+            "hello.com".try_into().unwrap(),
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            client
+                .read_hs(&encoding::server_hello(
+                    ProtocolVersion::TLSv1_2,
+                    &[0x12; 32],
+                    &[0],
+                    CipherSuite::TLS13_AES_128_GCM_SHA256,
+                    vec![
+                        encoding::Extension::new_versions_server_tls13(),
+                        encoding::Extension::new_dummy_key_share_server()
+                    ]
+                ))
+                .err(),
+            Some(PeerMisbehaved::SelectedUnofferedCipherSuite.into()),
+        );
+    }
+
+    /// TLS13_AES_128_GCM_SHA256 which doesn't support QUIC.
+    ///
+    /// Once `clone` is const this can be more directly written.
+    const TLS13_AES_128_GCM_SHA256_WITHOUT_QUIC: SupportedCipherSuite =
+        SupportedCipherSuite::Tls13(&Tls13CipherSuite {
+            common: CipherSuiteCommon {
+                suite: TLS13_AES_128_GCM_SHA256_INNER
+                    .common
+                    .suite,
+                hash_provider: TLS13_AES_128_GCM_SHA256_INNER
+                    .common
+                    .hash_provider,
+                confidentiality_limit: TLS13_AES_128_GCM_SHA256_INNER
+                    .common
+                    .confidentiality_limit,
+            },
+            hkdf_provider: TLS13_AES_128_GCM_SHA256_INNER.hkdf_provider,
+            aead_alg: TLS13_AES_128_GCM_SHA256_INNER.aead_alg,
+            quic: None,
+        });
+
+    /// nb. `Option::unwrap` is not const until rust 1.83.
+    const TLS13_AES_128_GCM_SHA256_INNER: &Tls13CipherSuite =
+        match provider::cipher_suite::TLS13_AES_128_GCM_SHA256.tls13() {
+            Some(inner) => inner,
+            None => unreachable!(),
+        };
 
     #[test]
     fn packet_key_api() {
@@ -6380,8 +6730,6 @@ fn test_client_tls12_no_resume_after_server_downgrade() {
 
 #[test]
 fn test_acceptor() {
-    use rustls::server::Acceptor;
-
     let provider = provider::default_provider();
     let client_config = Arc::new(make_client_config(KeyType::Ed25519, &provider));
     let mut client = ClientConnection::new(client_config, server_name("localhost")).unwrap();
@@ -6483,9 +6831,101 @@ fn test_acceptor() {
 }
 
 #[test]
-fn test_acceptor_rejected_handshake() {
-    use rustls::server::Acceptor;
+fn client_hello_acceptor_rejects_record_containing_subsequent_messages() {
+    let mut hello = encoding::basic_client_hello(vec![]);
+    hello.extend(encoding::handshake_framing(
+        HandshakeType::EncryptedExtensions,
+        vec![0, 0],
+    ));
+    hello.extend(encoding::handshake_framing(
+        HandshakeType::Finished,
+        vec![0; 32],
+    ));
+    let hello = encoding::message_framing(ContentType::Handshake, ProtocolVersion::TLSv1_2, hello);
 
+    let mut acceptor = Acceptor::default();
+    acceptor
+        .read_tls(&mut hello.as_slice())
+        .unwrap();
+    let (err, mut alert) = acceptor.accept().unwrap_err();
+    assert_eq!(err, PeerMisbehaved::KeyEpochWithPendingFragment.into());
+    let mut alert_content = Vec::new();
+    let _ = alert.write(&mut alert_content);
+    assert_eq!(
+        alert_content,
+        build_alert(AlertLevel::Fatal, AlertDescription::UnexpectedMessage, &[])
+    );
+}
+
+#[test]
+fn client_connection_rejects_record_containing_subsequent_messages() {
+    let mut server_flight = encoding::server_hello(
+        ProtocolVersion::TLSv1_2,
+        &[b'a'; 32],
+        &[0],
+        CipherSuite::TLS13_AES_128_GCM_SHA256,
+        vec![
+            encoding::Extension::new_versions_server_tls13(),
+            encoding::Extension::new_dummy_key_share_server(),
+        ],
+    );
+    server_flight.extend(encoding::handshake_framing(
+        HandshakeType::EncryptedExtensions,
+        vec![0, 0],
+    ));
+    server_flight.extend(encoding::handshake_framing(
+        HandshakeType::Finished,
+        vec![0; 32],
+    ));
+    let server_flight = encoding::message_framing(
+        ContentType::Handshake,
+        ProtocolVersion::TLSv1_2,
+        server_flight,
+    );
+
+    let provider = CryptoProvider {
+        kx_groups: vec![provider::kx_group::SECP256R1],
+        ..provider::default_provider()
+    };
+    let (mut client, _) = make_pair(KeyType::Rsa2048, &provider);
+    client
+        .read_tls(&mut server_flight.as_slice())
+        .unwrap();
+    assert_eq!(
+        client
+            .process_new_packets()
+            .unwrap_err(),
+        PeerMisbehaved::KeyEpochWithPendingFragment.into()
+    );
+}
+
+#[test]
+fn server_connection_rejects_record_containing_subsequent_messages() {
+    let mut client_flight = encoding::basic_client_hello(vec![]);
+    client_flight.extend(encoding::handshake_framing(
+        HandshakeType::Finished,
+        vec![0; 32],
+    ));
+    let client_flight = encoding::message_framing(
+        ContentType::Handshake,
+        ProtocolVersion::TLSv1_2,
+        client_flight,
+    );
+
+    let (_, mut server) = make_pair(KeyType::Rsa2048, &provider::default_provider());
+    server
+        .read_tls(&mut client_flight.as_slice())
+        .unwrap();
+    assert_eq!(
+        server
+            .process_new_packets()
+            .unwrap_err(),
+        PeerMisbehaved::KeyEpochWithPendingFragment.into()
+    );
+}
+
+#[test]
+fn test_acceptor_rejected_handshake() {
     let client_config = finish_client_config(
         KeyType::Ed25519,
         ClientConfig::builder_with_provider(provider::default_provider().into())
@@ -8183,3 +8623,182 @@ impl ActiveKeyExchange for FakeHybridActive {
 }
 
 const CONFIDENTIALITY_LIMIT: u64 = 1024;
+
+#[test]
+fn tls13_ticket_request_new_vs_resumed() {
+    let provider = provider::default_provider();
+    let shared_storage = Arc::new(ClientStorage::new());
+
+    let mut client_config =
+        make_client_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS13], &provider);
+    client_config.resumption = Resumption::store(shared_storage.clone());
+    client_config.send_ticket_request = Some(TicketRequest {
+        new_session_count: 3,
+        resumption_count: 1,
+    });
+    let client_config = Arc::new(client_config);
+
+    let mut server_config = make_server_config(KeyType::Rsa2048, &provider);
+    server_config.max_tls13_tickets = 5;
+    let server_config = Arc::new(server_config);
+
+    // new connection: server sends new_session_count (3)
+    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+    do_handshake(&mut client, &mut server);
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+
+    let ops = shared_storage.ops_and_reset();
+    let ticket_inserts = ops
+        .iter()
+        .filter(|op| matches!(op, ClientStorageOp::InsertTls13Ticket(_)))
+        .count();
+    assert_eq!(ticket_inserts, 3);
+
+    // resumed connection: server sends resumption_count (1)
+    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+    do_handshake(&mut client, &mut server);
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Resumed));
+
+    let ops = shared_storage.ops_and_reset();
+    let ticket_inserts = ops
+        .iter()
+        .filter(|op| matches!(op, ClientStorageOp::InsertTls13Ticket(_)))
+        .count();
+    assert_eq!(ticket_inserts, 1);
+}
+
+#[test]
+fn tls13_ticket_request_zero_means_no_tickets() {
+    let provider = provider::default_provider();
+    let shared_storage = Arc::new(ClientStorage::new());
+
+    let mut client_config =
+        make_client_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS13], &provider);
+    client_config.resumption = Resumption::store(shared_storage.clone());
+    client_config.send_ticket_request = Some(TicketRequest {
+        new_session_count: 0,
+        resumption_count: 0,
+    });
+    let client_config = Arc::new(client_config);
+
+    let mut server_config = make_server_config(KeyType::Rsa2048, &provider);
+    server_config.max_tls13_tickets = 5;
+    let server_config = Arc::new(server_config);
+
+    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+    do_handshake(&mut client, &mut server);
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+
+    let ops = shared_storage.ops_and_reset();
+    let ticket_inserts = ops
+        .iter()
+        .filter(|op| matches!(op, ClientStorageOp::InsertTls13Ticket(_)))
+        .count();
+    assert_eq!(ticket_inserts, 0);
+}
+
+#[test]
+fn tls13_ticket_request_capped_by_server() {
+    let provider = provider::default_provider();
+    let shared_storage = Arc::new(ClientStorage::new());
+
+    let mut client_config =
+        make_client_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS13], &provider);
+    client_config.resumption = Resumption::store(shared_storage.clone());
+    client_config.send_ticket_request = Some(TicketRequest {
+        new_session_count: 10,
+        resumption_count: 10,
+    });
+    let client_config = Arc::new(client_config);
+
+    let mut server_config = make_server_config(KeyType::Rsa2048, &provider);
+    server_config.max_tls13_tickets = 3;
+    let server_config = Arc::new(server_config);
+
+    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+    do_handshake(&mut client, &mut server);
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+
+    let ops = shared_storage.ops_and_reset();
+    let ticket_inserts = ops
+        .iter()
+        .filter(|op| matches!(op, ClientStorageOp::InsertTls13Ticket(_)))
+        .count();
+    assert_eq!(ticket_inserts, 3);
+}
+
+#[test]
+fn tls13_ticket_request_not_sent_when_none() {
+    let provider = provider::default_provider();
+    let shared_storage = Arc::new(ClientStorage::new());
+
+    let mut client_config =
+        make_client_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS13], &provider);
+    client_config.resumption = Resumption::store(shared_storage.clone());
+    client_config.send_ticket_request = None;
+    let client_config = Arc::new(client_config);
+
+    let mut server_config = make_server_config(KeyType::Rsa2048, &provider);
+    server_config.max_tls13_tickets = 8;
+    let server_config = Arc::new(server_config);
+
+    // without the extension, server uses send_tls13_tickets (default 2)
+    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+    do_handshake(&mut client, &mut server);
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+
+    let ops = shared_storage.ops_and_reset();
+    let ticket_inserts = ops
+        .iter()
+        .filter(|op| matches!(op, ClientStorageOp::InsertTls13Ticket(_)))
+        .count();
+    assert_eq!(ticket_inserts, 2);
+}
+
+#[cfg(feature = "aws_lc_rs")]
+#[test]
+fn ml_dsa() {
+    if !provider_is_aws_lc_rs() {
+        return;
+    }
+
+    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ML_DSA_44).unwrap();
+    let mut ca_params = CertificateParams::new(vec!["Test CA".into()]).unwrap();
+    ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+    ];
+    ca_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let issuer = CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
+
+    let ee_key = KeyPair::generate_for(&rcgen::PKCS_ML_DSA_87).unwrap();
+    let ee_params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+    let ee_cert = ee_params
+        .signed_by(&ee_key, &issuer)
+        .unwrap();
+
+    let provider = Arc::new(provider::default_provider());
+    let server_config = ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![ee_cert.der().clone()],
+            PrivateKeyDer::try_from(ee_key.serialize_der()).unwrap(),
+        )
+        .unwrap();
+
+    let mut roots = RootCertStore::empty();
+    roots.add(issuer.der().clone()).unwrap();
+    let client_config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    let mut client =
+        ClientConnection::new(Arc::new(client_config), "localhost".try_into().unwrap()).unwrap();
+    let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
+    do_handshake(&mut client, &mut server);
+}

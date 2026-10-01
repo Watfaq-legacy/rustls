@@ -1,3 +1,4 @@
+#[allow(clippy::double_must_use)] // https://github.com/rust-lang/rust-clippy/issues/17529
 pub(crate) mod async_io {
     //! Async IO building blocks required for sharing code between the instruction count and
     //! wall-time benchmarks
@@ -348,6 +349,7 @@ pub(crate) mod async_io {
     }
 }
 
+#[allow(clippy::std_instead_of_core)] // awaits core::io::Cursor in stable (1.97)
 pub(crate) mod transport {
     //! Custom functions to interact between rustls clients and a servers.
     //!
