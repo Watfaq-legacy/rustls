@@ -85,7 +85,7 @@ where
             .ok_or(Error::General("X25519 group required for Reality".into()))?;
         cx.common.kx_state = KxState::Start(x25519_group);
         None // Will be set later from reality_state
-    } else if config.supports_version(ProtocolVersion::TLSv1_3) {
+    } else if config.supports_version(ProtocolVersion::TLSv1_3, cx.common.protocol) {
         Some(tls13::initial_key_share(
             &config,
             &server_name,
